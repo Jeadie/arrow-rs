@@ -1,0 +1,90 @@
+# Manual, self-serve criterion benchmark for the `filter_kernels` bench.
+#
+# Runs the bench on a HEAD ref and a BASE ref and prints a critcmp comparison,
+# on both an ARM64 and an x86-64 GitHub-hosted runner. The ARM64 runner
+# (Neoverse N-class) is the interesting one: the `filter context i32 (kept 1/2)`
+# regression is a loop-alignment artifact that only shows on ARM Neoverse cores,
+# not on Apple Silicon (local) or x86-64. The x86 job is a control.
+#
+# Trigger from the Actions tab (workflow_dispatch). This file only needs to
+# exist on the branch you dispatch it from; it fetches and checks out the refs
+# you pass as inputs, so it does NOT have to live on the PR branch.
+name: filter-kernels-bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      head_ref:
+        description: "Branch or SHA to benchmark (HEAD)"
+        required: true
+        default: "jeadie/filter-list-specialization"
+      base_ref:
+        description: "Baseline branch or SHA. Use the commit's parent (44f377284) to isolate this commit."
+        required: true
+        default: "main"
+      filter:
+        description: "criterion benchmark-name regex"
+        required: true
+        default: "filter context (i32|u8|f32|decimal128)"
+
+concurrency:
+  group: filter-bench-${{ github.ref }}-${{ github.event.inputs.head_ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+          - runner: ubuntu-latest
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: filter-bench-${{ matrix.arch }}
+
+      - name: Install critcmp
+        run: cargo install critcmp --locked
+
+      - name: Fetch refs
+        run: git fetch --no-tags --force origin '+refs/heads/*:refs/remotes/origin/*'
+
+      # BASE first, then HEAD. criterion baselines live under target/criterion
+      # and survive the checkout, so critcmp can compare the two afterwards.
+      - name: Benchmark BASE (${{ github.event.inputs.base_ref }})
+        run: |
+          ref='${{ github.event.inputs.base_ref }}'
+          git checkout --force --detach "origin/$ref" 2>/dev/null || git checkout --force --detach "$ref"
+          git log -1 --oneline
+          cargo bench -p arrow --bench filter_kernels --features test_utils -- \
+            --save-baseline base --warm-up-time 3 --measurement-time 8 \
+            "${{ github.event.inputs.filter }}"
+
+      - name: Benchmark HEAD (${{ github.event.inputs.head_ref }})
+        run: |
+          ref='${{ github.event.inputs.head_ref }}'
+          git checkout --force --detach "origin/$ref" 2>/dev/null || git checkout --force --detach "$ref"
+          git log -1 --oneline
+          cargo bench -p arrow --bench filter_kernels --features test_utils -- \
+            --save-baseline head --warm-up-time 3 --measurement-time 8 \
+            "${{ github.event.inputs.filter }}"
+
+      - name: Compare (base vs head)
+        run: |
+          {
+            echo "## \`${{ matrix.runner }}\` (${{ matrix.arch }})"
+            echo "head=\`${{ github.event.inputs.head_ref }}\`  base=\`${{ github.event.inputs.base_ref }}\`"
+            echo '```'
+            critcmp base head
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
