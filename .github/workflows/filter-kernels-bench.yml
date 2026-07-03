@@ -1,10 +1,8 @@
 # Manual, self-serve criterion benchmark for the `filter_kernels` bench.
 #
 # Runs the bench on a HEAD ref and a BASE ref and prints a critcmp comparison,
-# on both an ARM64 and an x86-64 GitHub-hosted runner. The ARM64 runner
-# (Neoverse N-class) is the interesting one: the `filter context i32 (kept 1/2)`
-# regression is a loop-alignment artifact that only shows on ARM Neoverse cores,
-# not on Apple Silicon (local) or x86-64. The x86 job is a control.
+# on both an ARM64 and an x86-64 GitHub-hosted runner, so a head-vs-base delta
+# can be checked across architectures.
 #
 # Trigger from the Actions tab (workflow_dispatch). This file only needs to
 # exist on the branch you dispatch it from; it fetches and checks out the refs
@@ -23,8 +21,8 @@ on:
         required: true
         default: "main"
       filter:
-        description: "criterion benchmark-name regex"
-        required: true
+        description: "criterion benchmark-name regex (leave EMPTY to run ALL filter_kernels benchmarks)"
+        required: false
         default: "filter context (i32|u8|f32|decimal128)"
 
 concurrency:
@@ -62,22 +60,26 @@ jobs:
       # BASE first, then HEAD. criterion baselines live under target/criterion
       # and survive the checkout, so critcmp can compare the two afterwards.
       - name: Benchmark BASE (${{ github.event.inputs.base_ref }})
+        env:
+          REF: ${{ github.event.inputs.base_ref }}
+          FILTER: ${{ github.event.inputs.filter }}
         run: |
-          ref='${{ github.event.inputs.base_ref }}'
-          git checkout --force --detach "origin/$ref" 2>/dev/null || git checkout --force --detach "$ref"
+          git checkout --force --detach "origin/$REF" 2>/dev/null || git checkout --force --detach "$REF"
           git log -1 --oneline
-          cargo bench -p arrow --bench filter_kernels --features test_utils -- \
-            --save-baseline base --warm-up-time 3 --measurement-time 8 \
-            "${{ github.event.inputs.filter }}"
+          args=(--save-baseline base --warm-up-time 3 --measurement-time 8)
+          [ -n "$FILTER" ] && args+=("$FILTER")   # empty filter => run all benchmarks
+          cargo bench -p arrow --bench filter_kernels --features test_utils -- "${args[@]}"
 
       - name: Benchmark HEAD (${{ github.event.inputs.head_ref }})
+        env:
+          REF: ${{ github.event.inputs.head_ref }}
+          FILTER: ${{ github.event.inputs.filter }}
         run: |
-          ref='${{ github.event.inputs.head_ref }}'
-          git checkout --force --detach "origin/$ref" 2>/dev/null || git checkout --force --detach "$ref"
+          git checkout --force --detach "origin/$REF" 2>/dev/null || git checkout --force --detach "$REF"
           git log -1 --oneline
-          cargo bench -p arrow --bench filter_kernels --features test_utils -- \
-            --save-baseline head --warm-up-time 3 --measurement-time 8 \
-            "${{ github.event.inputs.filter }}"
+          args=(--save-baseline head --warm-up-time 3 --measurement-time 8)
+          [ -n "$FILTER" ] && args+=("$FILTER")   # empty filter => run all benchmarks
+          cargo bench -p arrow --bench filter_kernels --features test_utils -- "${args[@]}"
 
       - name: Compare (base vs head)
         run: |
