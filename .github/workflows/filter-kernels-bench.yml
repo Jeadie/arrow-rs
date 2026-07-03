@@ -26,8 +26,10 @@ on:
         default: ""
 
 concurrency:
-  group: filter-bench-${{ github.ref }}-${{ github.event.inputs.head_ref }}
-  cancel-in-progress: true
+  # Unique per run so repeated dispatches (e.g. variance sampling) run in
+  # parallel instead of cancelling each other.
+  group: filter-bench-${{ github.run_id }}
+  cancel-in-progress: false
 
 jobs:
   bench:
