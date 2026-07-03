@@ -23,7 +23,7 @@ on:
       filter:
         description: "criterion benchmark-name regex (leave EMPTY to run ALL filter_kernels benchmarks)"
         required: false
-        default: "filter context (i32|u8|f32|decimal128)"
+        default: ""
 
 concurrency:
   group: filter-bench-${{ github.ref }}-${{ github.event.inputs.head_ref }}
