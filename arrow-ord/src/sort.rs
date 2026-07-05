@@ -551,7 +551,35 @@ fn sort_dictionary<K: ArrowDictionaryKeyType>(
     limit: Option<usize>,
 ) -> Result<UInt32Array, ArrowError> {
     let keys: &PrimitiveArray<K> = dict.keys();
-    let rank = child_rank(dict.values().as_ref(), options)?;
+    let dict_len = dict.values().len();
+
+    // If the rows reference far fewer values than the dictionary contains
+    // (e.g. a selective filter over a high-cardinality dictionary), rank only
+    // the referenced dictionary values instead of the entire dictionary.
+    // Relative ranks among the referenced values are sufficient, as unused
+    // values are never compared. The sparse path costs O(rows + dict_len)
+    // bookkeeping, so it is only taken when it can save ranking at least
+    // half the dictionary
+    let rank = if value_indices.len() < dict_len / 2 {
+        let mut seen = vec![false; dict_len];
+        for &index in &value_indices {
+            seen[keys.value(index as usize).as_usize()] = true;
+        }
+        let used: Vec<u32> = seen
+            .iter()
+            .enumerate()
+            .filter_map(|(key, seen)| seen.then_some(key as u32))
+            .collect();
+        let subset = take(dict.values().as_ref(), &UInt32Array::from(used.clone()), None)?;
+        let subset_rank = child_rank(subset.as_ref(), options)?;
+        let mut rank = vec![0; dict_len];
+        for (&key, &r) in used.iter().zip(&subset_rank) {
+            rank[key as usize] = r;
+        }
+        rank
+    } else {
+        child_rank(dict.values().as_ref(), options)?
+    };
 
     // create tuples that are used for sorting
     let mut valids = value_indices
