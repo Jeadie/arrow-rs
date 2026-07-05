@@ -1136,8 +1136,20 @@ impl<T: DataType> Decoder<T> for DeltaByteArrayDecoder<T> {
         match T::get_physical_type() {
             Type::BYTE_ARRAY | Type::FIXED_LEN_BYTE_ARRAY => {
                 let num_values = cmp::min(buffer.len(), self.num_values);
+                if num_values == 0 {
+                    return Ok(0);
+                }
                 let mut v: [ByteArray; 1] = [ByteArray::new(); 1];
-                for item in buffer.iter_mut().take(num_values) {
+
+                // Materialize all values of this batch into a single contiguous
+                // buffer, tracking the end offset of each value. Cheap zero-copy
+                // `Bytes` slices of that buffer are then handed out per value,
+                // avoiding a `Vec` allocation and `Bytes` promotion per value.
+                let mut output: Vec<u8> = Vec::new();
+                let mut offsets: Vec<usize> = Vec::with_capacity(num_values + 1);
+                offsets.push(0);
+
+                for idx in 0..num_values {
                     // Process suffix
                     // TODO: this is awkward - maybe we should add a non-vectorized API?
                     let suffix_decoder = self
@@ -1156,25 +1168,40 @@ impl<T: DataType> Decoder<T> for DeltaByteArrayDecoder<T> {
                             )
                         })?;
 
-                    if prefix_len > self.previous_value.len() {
+                    // Concatenate prefix with suffix. The prefix of the first
+                    // value of the batch comes from `previous_value` (carried
+                    // over from the previous call), all subsequent prefixes
+                    // reference the previously decoded value inside `output`.
+                    let start = output.len();
+                    let previous = if idx == 0 {
+                        &self.previous_value[..]
+                    } else {
+                        &output[offsets[idx - 1]..start]
+                    };
+                    if prefix_len > previous.len() {
                         return Err(general_err!(
                             "Invalid DELTA_BYTE_ARRAY prefix length {} exceeds previous value length {}",
                             prefix_len,
-                            self.previous_value.len()
+                            previous.len()
                         ));
                     }
+                    if idx == 0 {
+                        output.extend_from_slice(&self.previous_value[..prefix_len]);
+                    } else {
+                        let prev_start = offsets[idx - 1];
+                        output.extend_from_within(prev_start..prev_start + prefix_len);
+                    }
+                    output.extend_from_slice(suffix);
+                    offsets.push(output.len());
 
-                    // Concatenate prefix with suffix
-                    let mut result = Vec::with_capacity(prefix_len + suffix.len());
-                    result.extend_from_slice(&self.previous_value[0..prefix_len]);
-                    result.extend_from_slice(suffix);
-
-                    let data = Bytes::from(result);
-                    item.set_from_bytes(data.clone());
-
-                    self.previous_value = data;
                     self.current_idx += 1;
                 }
+
+                let data = Bytes::from(output);
+                for (idx, item) in buffer.iter_mut().take(num_values).enumerate() {
+                    item.set_from_bytes(data.slice(offsets[idx]..offsets[idx + 1]));
+                }
+                self.previous_value = data.slice(offsets[num_values - 1]..offsets[num_values]);
 
                 self.num_values -= num_values;
                 Ok(num_values)
