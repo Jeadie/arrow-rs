@@ -95,10 +95,7 @@ fn build_extend_null_bits(array: &ArrayData, use_nulls: bool) -> ExtendNullBits<
             let mutable_len = mutable.len;
             let out = mutable.null_buffer();
             utils::resize_for_bits(out, mutable_len + len);
-            let write_data = out.as_slice_mut();
-            (0..len).for_each(|i| {
-                bit_util::set_bit(write_data, mutable_len + i);
-            });
+            utils::set_bits_range(out.as_slice_mut(), mutable_len, len);
         })
     } else {
         Box::new(|_, _, _| {})

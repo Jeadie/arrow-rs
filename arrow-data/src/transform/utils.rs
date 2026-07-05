@@ -29,6 +29,29 @@ pub(super) fn resize_for_bits(buffer: &mut MutableBuffer, len: usize) {
     }
 }
 
+/// Sets `len` bits, starting at bit `offset`, to `1` in `data`, a byte at a
+/// time, leaving all other bits unchanged
+#[inline]
+pub(super) fn set_bits_range(data: &mut [u8], offset: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let end = offset + len;
+    let first_byte = offset / 8;
+    let last_byte = (end - 1) / 8;
+    // bits at and above `offset % 8`
+    let first_mask = 0xFFu8 << (offset % 8);
+    // bits at and below `(end - 1) % 8`
+    let last_mask = 0xFFu8 >> (7 - (end - 1) % 8);
+    if first_byte == last_byte {
+        data[first_byte] |= first_mask & last_mask;
+    } else {
+        data[first_byte] |= first_mask;
+        data[first_byte + 1..last_byte].fill(0xFF);
+        data[last_byte] |= last_mask;
+    }
+}
+
 /// Extends `buffer` with the re-based offsets from `offsets`, returning an error on overflow.
 pub(super) fn try_extend_offsets<T: ArrowNativeType + Integer + CheckedAdd>(
     buffer: &mut MutableBuffer,
@@ -76,8 +99,27 @@ pub(super) unsafe fn get_last_offset<T: ArrowNativeType>(offset_buffer: &Mutable
 
 #[cfg(test)]
 mod tests {
-    use crate::transform::utils::try_extend_offsets;
-    use arrow_buffer::MutableBuffer;
+    use crate::transform::utils::{set_bits_range, try_extend_offsets};
+    use arrow_buffer::{MutableBuffer, bit_util};
+
+    #[test]
+    fn test_set_bits_range() {
+        for offset in 0..=24 {
+            for len in 0..=24 {
+                let mut expected = vec![0u8; 8];
+                (offset..offset + len).for_each(|i| bit_util::set_bit(&mut expected, i));
+
+                let mut actual = vec![0u8; 8];
+                set_bits_range(&mut actual, offset, len);
+                assert_eq!(actual, expected, "offset: {offset}, len: {len}");
+
+                // must leave already set bits outside the range unchanged
+                let mut actual = vec![0xFFu8; 8];
+                set_bits_range(&mut actual, offset, len);
+                assert_eq!(actual, vec![0xFFu8; 8], "offset: {offset}, len: {len}");
+            }
+        }
+    }
 
     #[test]
     fn test_overflow_returns_error() {
