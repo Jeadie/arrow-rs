@@ -210,6 +210,24 @@ fn add_benchmark(c: &mut Criterion) {
         b.iter(|| bench_sort_to_indices(&arr, None))
     });
 
+    // Large dictionary but only a small number of distinct keys referenced,
+    // simulating sorting the result of a selective filter over a
+    // high-cardinality dictionary column
+    let values = StringArray::from_iter_values((0..100_000).map(|i| format!("value_{i:08}")));
+    let keys = Int32Array::from_iter_values((0..4096).map(|i| (i % 16) * 6000));
+    let arr = DictionaryArray::new(keys, Arc::new(values));
+    c.bench_function("sort string dict[100k values, 16 used] to indices 2^12", |b| {
+        b.iter(|| bench_sort_to_indices(&arr, None))
+    });
+
+    // Dense dictionary: every dictionary value is referenced by the keys
+    let values = StringArray::from_iter_values((0..4096).map(|i| format!("value_{i:08}")));
+    let keys = Int32Array::from_iter_values((0..4096).map(|i| (i * 7919) % 4096));
+    let arr = DictionaryArray::new(keys, Arc::new(values));
+    c.bench_function("sort string dict[4096 values, all used] to indices 2^12", |b| {
+        b.iter(|| bench_sort_to_indices(&arr, None))
+    });
+
     let run_encoded_array =
         create_primitive_run_array::<Int16Type, Int32Type>(2usize.pow(12), 2usize.pow(10));
 
