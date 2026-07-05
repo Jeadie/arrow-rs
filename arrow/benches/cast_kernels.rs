@@ -127,6 +127,14 @@ fn build_string_array(size: usize) -> ArrayRef {
     Arc::new(builder.finish())
 }
 
+fn build_string_decimal_array(size: usize) -> ArrayRef {
+    let mut builder = StringBuilder::new();
+    for i in 0..size {
+        builder.append_value(format!("{}.{:04}", 10000 + i, i % 10000));
+    }
+    Arc::new(builder.finish())
+}
+
 fn build_string_float_array(size: usize, null_density: f32) -> ArrayRef {
     let mut builder = StringBuilder::new();
 
@@ -404,6 +412,26 @@ fn add_benchmark(c: &mut Criterion) {
         "cast string to decimal128(38, 3)",
         string_float_array_normal,
         DataType::Decimal128(38, 3)
+    );
+
+    // cast fractional strings (e.g. "12345.6789") to decimals; scale 10
+    // exercises fraction zero-padding, scale 2 exercises rounding of excess
+    // fractional digits
+    let string_decimal_array = build_string_decimal_array(4096);
+    benchmark_cast!(
+        "cast string to decimal128(38, 10) fractional 4096",
+        string_decimal_array,
+        DataType::Decimal128(38, 10)
+    );
+    benchmark_cast!(
+        "cast string to decimal128(38, 2) rounding 4096",
+        string_decimal_array,
+        DataType::Decimal128(38, 2)
+    );
+    benchmark_cast!(
+        "cast string to decimal256(76, 10) fractional 4096",
+        string_decimal_array,
+        DataType::Decimal256(76, 10)
     );
 
     // cast float64 to decimals

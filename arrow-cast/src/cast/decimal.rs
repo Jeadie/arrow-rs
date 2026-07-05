@@ -529,6 +529,42 @@ where
     )?))
 }
 
+/// Parses a slice of ascii digits into an `i128`.
+///
+/// Returns `None` if any byte is not an ascii digit.
+///
+/// The caller must ensure `digits.len() <= 38` so the accumulation cannot
+/// overflow (`10^38 - 1 < i128::MAX`).
+#[inline]
+fn parse_digits_i128(digits: &[u8]) -> Option<i128> {
+    let mut v: i128 = 0;
+    for &b in digits {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        v = v * 10 + (b - b'0') as i128;
+    }
+    Some(v)
+}
+
+/// Parses a slice of ascii digits into a non-negative `i256`.
+///
+/// Returns `None` if any byte is not an ascii digit or the value overflows
+/// `i256`.
+fn parse_digits_i256(digits: &[u8]) -> Option<i256> {
+    let ten = i256::from_i128(10);
+    let mut v = i256::ZERO;
+    for &b in digits {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        v = v
+            .checked_mul(ten)?
+            .checked_add(i256::from_i128((b - b'0') as i128))?;
+    }
+    Some(v)
+}
+
 /// Parses given string to specified decimal native (i128/i256) based on given
 /// scale. Returns an `Err` if it cannot parse given string.
 pub fn parse_string_to_decimal_native<T: DecimalType>(
@@ -539,96 +575,158 @@ where
     T::Native: DecimalCast + ArrowNativeTypeOp,
 {
     let value_str = value_str.trim();
-    let parts: Vec<&str> = value_str.split('.').collect();
-    if parts.len() > 2 {
-        return Err(ArrowError::InvalidArgumentError(format!(
-            "Invalid decimal format: {value_str:?}"
-        )));
-    }
+    let bytes = value_str.as_bytes();
 
-    let (negative, first_part) = if parts[0].is_empty() {
-        (false, parts[0])
-    } else {
-        match parts[0].as_bytes()[0] {
-            b'-' => (true, &parts[0][1..]),
-            b'+' => (false, &parts[0][1..]),
-            _ => (false, parts[0]),
+    let invalid =
+        || ArrowError::InvalidArgumentError(format!("Invalid decimal format: {value_str:?}"));
+
+    // Split into integer and fractional digits on the first `.`
+    let (integers, decimals): (&[u8], &[u8]) = match bytes.iter().position(|&b| b == b'.') {
+        Some(i) => {
+            let decimals = &bytes[i + 1..];
+            if decimals.contains(&b'.') {
+                return Err(invalid());
+            }
+            (&bytes[..i], decimals)
         }
+        None => (bytes, &[]),
     };
 
-    let integers = first_part;
-    let decimals = if parts.len() == 2 { parts[1] } else { "" };
+    // Extract sign from the integer part
+    let (negative, integers) = match integers.first() {
+        Some(b'-') => (true, &integers[1..]),
+        Some(b'+') => (false, &integers[1..]),
+        _ => (false, integers),
+    };
 
     if integers.is_empty() && decimals.is_empty() {
-        return Err(ArrowError::InvalidArgumentError(format!(
-            "Invalid decimal format: {value_str:?}"
-        )));
+        return Err(invalid());
     }
 
-    if !integers.is_empty() && !integers.as_bytes()[0].is_ascii_digit() {
-        return Err(ArrowError::InvalidArgumentError(format!(
-            "Invalid decimal format: {value_str:?}"
-        )));
+    if !integers.is_empty() && !integers[0].is_ascii_digit() {
+        return Err(invalid());
     }
 
-    if !decimals.is_empty() && !decimals.as_bytes()[0].is_ascii_digit() {
-        return Err(ArrowError::InvalidArgumentError(format!(
-            "Invalid decimal format: {value_str:?}"
-        )));
+    if !decimals.is_empty() && !decimals[0].is_ascii_digit() {
+        return Err(invalid());
     }
 
-    // Adjust decimal based on scale
-    let mut number_decimals = if decimals.len() > scale {
-        let decimal_number = i256::from_string(decimals).ok_or_else(|| {
-            ArrowError::InvalidArgumentError(format!("Cannot parse decimal format: {value_str}"))
-        })?;
-
-        let div = i256::from_i128(10_i128).pow_checked((decimals.len() - scale) as u32)?;
-
-        let half = div.div_wrapping(i256::from_i128(2));
-        let half_neg = half.neg_wrapping();
-
-        let d = decimal_number.div_wrapping(div);
-        let r = decimal_number.mod_wrapping(div);
-
-        // Round result
-        let adjusted = match decimal_number >= i256::ZERO {
-            true if r >= half => d.add_wrapping(i256::ONE),
-            false if r <= half_neg => d.sub_wrapping(i256::ONE),
-            _ => d,
-        };
-
-        let integers = if !integers.is_empty() {
-            i256::from_string(integers)
-                .ok_or_else(|| {
-                    ArrowError::InvalidArgumentError(format!(
-                        "Cannot parse decimal format: {value_str}"
-                    ))
-                })
-                .map(|v| v.mul_wrapping(i256::from_i128(10_i128).pow_wrapping(scale as u32)))?
-        } else {
-            i256::ZERO
-        };
-
-        format!("{}", integers.add_wrapping(adjusted))
-    } else {
-        let padding = if scale > decimals.len() { scale } else { 0 };
-
-        let decimals = format!("{decimals:0<padding$}");
-        format!("{integers}{decimals}")
-    };
-
-    if negative {
-        number_decimals.insert(0, '-');
-    }
-
-    let value = i256::from_string(number_decimals.as_str()).ok_or_else(|| {
+    let overflow_err = || {
         ArrowError::InvalidArgumentError(format!(
             "Cannot convert {} to {}: Overflow",
             value_str,
             T::PREFIX
         ))
-    })?;
+    };
+
+    // Combine the integer and fractional digits into an unscaled value,
+    // adjusting the fractional digits to `scale`
+    let value: i256 = if decimals.len() > scale {
+        // More fractional digits than the target scale: round the excess
+        // digits half away from zero
+        let parse_err = || {
+            ArrowError::InvalidArgumentError(format!("Cannot parse decimal format: {value_str}"))
+        };
+
+        // Fast path: both the fractional digits and the scaled integer part
+        // are guaranteed to fit into an i128 (10^38 - 1 < i128::MAX)
+        let number = if decimals.len() <= 38 && integers.len() + scale <= 38 {
+            let decimal_number = parse_digits_i128(decimals).ok_or_else(parse_err)?;
+
+            let div = 10_i128.pow((decimals.len() - scale) as u32);
+
+            let d = decimal_number / div;
+            let r = decimal_number % div;
+
+            // Round result
+            let adjusted = if r >= div / 2 { d + 1 } else { d };
+
+            let integers = if !integers.is_empty() {
+                parse_digits_i128(integers).ok_or_else(parse_err)? * 10_i128.pow(scale as u32)
+            } else {
+                0
+            };
+
+            i256::from_i128(integers + adjusted)
+        } else {
+            let decimal_number = parse_digits_i256(decimals).ok_or_else(parse_err)?;
+
+            let div = i256::from_i128(10_i128).pow_checked((decimals.len() - scale) as u32)?;
+
+            let half = div.div_wrapping(i256::from_i128(2));
+
+            let d = decimal_number.div_wrapping(div);
+            let r = decimal_number.mod_wrapping(div);
+
+            // Round result (`decimal_number` is never negative)
+            let adjusted = if r >= half {
+                d.add_wrapping(i256::ONE)
+            } else {
+                d
+            };
+
+            let integers = if !integers.is_empty() {
+                parse_digits_i256(integers)
+                    .ok_or_else(parse_err)?
+                    .mul_wrapping(i256::from_i128(10_i128).pow_wrapping(scale as u32))
+            } else {
+                i256::ZERO
+            };
+
+            integers.add_wrapping(adjusted)
+        };
+
+        if negative {
+            if number < i256::ZERO {
+                return Err(overflow_err());
+            }
+            number.neg_wrapping()
+        } else {
+            number
+        }
+    } else {
+        // Fewer fractional digits than the target scale: pad with trailing
+        // zeros
+        let zeros = scale.saturating_sub(decimals.len());
+
+        // Fast path: the result is guaranteed to fit into an i128
+        // (10^38 - 1 < i128::MAX)
+        if integers.len() + decimals.len() + zeros <= 38 {
+            let mut v: i128 = 0;
+            for &b in integers.iter().chain(decimals) {
+                if !b.is_ascii_digit() {
+                    return Err(overflow_err());
+                }
+                v = v * 10 + (b - b'0') as i128;
+            }
+            v *= 10_i128.pow(zeros as u32);
+            i256::from_i128(if negative { -v } else { v })
+        } else {
+            let ten = i256::from_i128(10);
+            let mut v = i256::ZERO;
+            for &b in integers.iter().chain(decimals) {
+                if !b.is_ascii_digit() {
+                    return Err(overflow_err());
+                }
+                let d = i256::from_i128((b - b'0') as i128);
+                // Accumulate towards the sign of the result so that
+                // `i256::MIN` remains representable
+                v = v.checked_mul(ten).ok_or_else(overflow_err)?;
+                v = if negative {
+                    v.checked_sub(d)
+                } else {
+                    v.checked_add(d)
+                }
+                .ok_or_else(overflow_err)?;
+            }
+            if v != i256::ZERO {
+                for _ in 0..zeros {
+                    v = v.checked_mul(ten).ok_or_else(overflow_err)?;
+                }
+            }
+            v
+        }
+    };
 
     T::Native::from_decimal(value).ok_or_else(|| {
         ArrowError::InvalidArgumentError(format!("Cannot convert {} to {}", value_str, T::PREFIX))
