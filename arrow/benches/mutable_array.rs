@@ -23,8 +23,12 @@ use rand::Rng;
 
 extern crate arrow;
 
+use arrow::datatypes::Int32Type;
 use arrow::util::test_util::seedable_rng;
-use arrow::{array::*, util::bench_util::create_string_array};
+use arrow::{
+    array::*,
+    util::bench_util::{create_primitive_array, create_string_array},
+};
 
 fn create_slices(size: usize) -> Vec<(usize, usize)> {
     let rng = &mut seedable_rng();
@@ -47,6 +51,19 @@ fn bench<T: Array>(v1: &T, slices: &[(usize, usize)]) {
     mutable.freeze();
 }
 
+/// Extends only from `v1` (which has no nulls), but `v2` (which has nulls)
+/// forces the `MutableArrayData` to track validity, exercising the
+/// `use_nulls` branch of `build_extend_null_bits` for null-free sources
+fn bench_mixed_no_nulls<T: Array>(v1: &T, v2: &T, slices: &[(usize, usize)]) {
+    let d1 = v1.to_data();
+    let d2 = v2.to_data();
+    let mut mutable = MutableArrayData::new(vec![&d1, &d2], false, 5);
+    for (start, end) in slices {
+        mutable.try_extend(0, *start, *end).unwrap();
+    }
+    mutable.freeze();
+}
+
 fn add_benchmark(c: &mut Criterion) {
     let v1 = create_string_array::<i32>(1024, 0.0);
     let v2 = create_slices(1024);
@@ -55,6 +72,13 @@ fn add_benchmark(c: &mut Criterion) {
     let v1 = create_string_array::<i32>(1024, 0.5);
     let v2 = create_slices(1024);
     c.bench_function("mutable str nulls 1024", |b| b.iter(|| bench(&v1, &v2)));
+
+    let v1 = create_primitive_array::<Int32Type>(1024, 0.0);
+    let v2 = create_primitive_array::<Int32Type>(1024, 0.5);
+    let slices = create_slices(1024);
+    c.bench_function("mutable int32 use_nulls no_null_source 1024", |b| {
+        b.iter(|| bench_mixed_no_nulls(&v1, &v2, &slices))
+    });
 }
 
 criterion_group!(benches, add_benchmark);
