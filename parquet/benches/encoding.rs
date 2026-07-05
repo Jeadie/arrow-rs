@@ -19,7 +19,8 @@ use criterion::*;
 use half::f16;
 use parquet::basic::{Encoding, Type as ParquetType};
 use parquet::data_type::{
-    DataType, DoubleType, FixedLenByteArray, FixedLenByteArrayType, FloatType,
+    ByteArray, ByteArrayType, DataType, DoubleType, FixedLenByteArray, FixedLenByteArrayType,
+    FloatType,
 };
 use parquet::decoding::{Decoder, get_decoder};
 use parquet::encoding::get_encoder;
@@ -84,6 +85,10 @@ fn criterion_benchmark(c: &mut Criterion) {
     let mut f32s = Vec::new();
     let mut f64s = Vec::new();
     let mut d128s = Vec::new();
+    // Sorted string-like data with shared prefixes, typical DELTA_BYTE_ARRAY input
+    let strings: Vec<ByteArray> = (0..n)
+        .map(|i| ByteArray::from(format!("some/shared/prefix/key-{:08}", i % 4096).as_str()))
+        .collect();
     for _ in 0..n {
         f16s.push(FixedLenByteArray::from(
             f16::from_f32(rng.random::<f32>()).to_le_bytes().to_vec(),
@@ -99,6 +104,7 @@ fn criterion_benchmark(c: &mut Criterion) {
     bench_typed::<DoubleType>(c, &f64s, Encoding::BYTE_STREAM_SPLIT, 0);
     bench_typed::<FixedLenByteArrayType>(c, &f16s, Encoding::BYTE_STREAM_SPLIT, 2);
     bench_typed::<FixedLenByteArrayType>(c, &d128s, Encoding::BYTE_STREAM_SPLIT, 16);
+    bench_typed::<ByteArrayType>(c, &strings, Encoding::DELTA_BYTE_ARRAY, 0);
 }
 
 criterion_group!(benches, criterion_benchmark);
