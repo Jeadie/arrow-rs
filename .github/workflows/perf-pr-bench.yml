@@ -1,0 +1,114 @@
+# Manual, self-serve criterion before/after benchmark for any bench target.
+#
+# Generalization of filter-kernels-bench.yml: runs a bench on a HEAD ref and a
+# BASE ref (e.g. a `bench-only-*` branch = trunk + benchmarks, no fix) and
+# prints a critcmp comparison, on both an ARM64 and an x86-64 GitHub-hosted
+# runner.
+#
+# Trigger from the Actions tab (workflow_dispatch). This file only needs to
+# exist on the branch you dispatch it from; it fetches and checks out the refs
+# you pass as inputs, so it does NOT have to live on the PR branch.
+name: perf-pr-bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      head_ref:
+        description: "Branch or SHA to benchmark (HEAD, with the fix)"
+        required: true
+      base_ref:
+        description: "Baseline branch or SHA (e.g. bench-only-* = trunk + benchmarks)"
+        required: true
+      package:
+        description: "Cargo package (-p)"
+        required: true
+        default: "arrow"
+      bench:
+        description: "Bench target (--bench)"
+        required: true
+      features:
+        description: "Comma-separated cargo features (empty for none)"
+        required: false
+        default: ""
+      filter:
+        description: "criterion benchmark-name regex (empty = run ALL benches in the target)"
+        required: false
+        default: ""
+
+concurrency:
+  # Unique per run so repeated dispatches (e.g. variance sampling) run in
+  # parallel instead of cancelling each other.
+  group: perf-pr-bench-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  bench:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+          - runner: ubuntu-latest
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: perf-pr-bench-${{ matrix.arch }}-${{ github.event.inputs.package }}-${{ github.event.inputs.bench }}
+
+      - name: Install critcmp
+        run: cargo install critcmp --locked
+
+      - name: Fetch refs
+        run: git fetch --no-tags --force origin '+refs/heads/*:refs/remotes/origin/*'
+
+      # BASE first, then HEAD. criterion baselines live under target/criterion
+      # and survive the checkout, so critcmp can compare the two afterwards.
+      - name: Benchmark BASE (${{ github.event.inputs.base_ref }})
+        env:
+          REF: ${{ github.event.inputs.base_ref }}
+          FILTER: ${{ github.event.inputs.filter }}
+          PKG: ${{ github.event.inputs.package }}
+          BENCH: ${{ github.event.inputs.bench }}
+          FEATURES: ${{ github.event.inputs.features }}
+        run: |
+          git checkout --force --detach "origin/$REF" 2>/dev/null || git checkout --force --detach "$REF"
+          git log -1 --oneline
+          cargo_args=(-p "$PKG" --bench "$BENCH")
+          [ -n "$FEATURES" ] && cargo_args+=(--features "$FEATURES")
+          args=(--save-baseline base --warm-up-time 3 --measurement-time 8)
+          [ -n "$FILTER" ] && args+=("$FILTER")
+          cargo bench "${cargo_args[@]}" -- "${args[@]}"
+
+      - name: Benchmark HEAD (${{ github.event.inputs.head_ref }})
+        env:
+          REF: ${{ github.event.inputs.head_ref }}
+          FILTER: ${{ github.event.inputs.filter }}
+          PKG: ${{ github.event.inputs.package }}
+          BENCH: ${{ github.event.inputs.bench }}
+          FEATURES: ${{ github.event.inputs.features }}
+        run: |
+          git checkout --force --detach "origin/$REF" 2>/dev/null || git checkout --force --detach "$REF"
+          git log -1 --oneline
+          cargo_args=(-p "$PKG" --bench "$BENCH")
+          [ -n "$FEATURES" ] && cargo_args+=(--features "$FEATURES")
+          args=(--save-baseline head --warm-up-time 3 --measurement-time 8)
+          [ -n "$FILTER" ] && args+=("$FILTER")
+          cargo bench "${cargo_args[@]}" -- "${args[@]}"
+
+      - name: Compare (base vs head)
+        run: |
+          {
+            echo "## \`${{ matrix.runner }}\` (${{ matrix.arch }})"
+            echo "head=\`${{ github.event.inputs.head_ref }}\`  base=\`${{ github.event.inputs.base_ref }}\`"
+            echo '```'
+            critcmp base head
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
