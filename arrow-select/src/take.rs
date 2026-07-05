@@ -30,7 +30,7 @@ use arrow_buffer::{
     ScalarBuffer, bit_util,
 };
 use arrow_data::transform::MutableArrayData;
-use arrow_schema::{ArrowError, DataType, FieldRef, UnionMode};
+use arrow_schema::{ArrowError, DataType, UnionMode};
 
 use num_traits::Zero;
 
@@ -276,26 +276,25 @@ fn take_impl<IndexType: ArrowPrimitiveType>(
                 .iter()
                 .map(|a| take_impl(a.as_ref(), indices))
                 .collect::<Result<Vec<ArrayRef>, _>>()?;
-            let fields: Vec<(FieldRef, ArrayRef)> =
-                fields.iter().cloned().zip(arrays).collect();
-
-            // Create the null bit buffer.
-            let is_valid: Buffer = indices
-                .iter()
-                .map(|index| {
-                    if let Some(index) = index {
-                        array.is_valid(index.to_usize().unwrap())
-                    } else {
-                        false
-                    }
-                })
-                .collect();
+            // Create the null buffer.
+            let nulls = if array.null_count() == 0 {
+                // Fast path: if the struct array has no nulls, the output
+                // validity is just the validity of the indices
+                indices.nulls().cloned()
+            } else {
+                let is_valid: Buffer = indices
+                    .iter()
+                    .map(|index| {
+                        index.is_some_and(|index| array.is_valid(index.to_usize().unwrap()))
+                    })
+                    .collect();
+                Some(NullBuffer::new(BooleanBuffer::new(is_valid, 0, indices.len())))
+            };
 
             if fields.is_empty() {
-                let nulls = NullBuffer::new(BooleanBuffer::new(is_valid, 0, indices.len()));
-                Ok(Arc::new(StructArray::new_empty_fields(indices.len(), Some(nulls))))
+                Ok(Arc::new(StructArray::new_empty_fields(indices.len(), nulls)))
             } else {
-                Ok(Arc::new(StructArray::from((fields, is_valid))) as ArrayRef)
+                Ok(Arc::new(StructArray::try_new(fields.clone(), arrays, nulls)?) as ArrayRef)
             }
         }
         DataType::Dictionary(_, _) => downcast_dictionary_array! {
@@ -2399,6 +2398,54 @@ mod tests {
         ]);
 
         assert_eq!(&expected, actual);
+    }
+
+    #[test]
+    fn test_take_struct_without_nulls() {
+        // Fast path: when the struct has no top-level nulls the output
+        // validity is the validity of the indices
+        let array = create_test_struct(vec![
+            Some((Some(true), Some(42))),
+            Some((Some(false), Some(28))),
+            Some((Some(false), Some(19))),
+            Some((Some(true), Some(31))),
+        ]);
+        assert_eq!(array.null_count(), 0);
+
+        // Nullable indices
+        let index = UInt32Array::from(vec![None, Some(3), Some(1), None, Some(0)]);
+        let actual = take(&array, &index, None).unwrap();
+        let expected = create_test_struct(vec![
+            None,
+            Some((Some(true), Some(31))),
+            Some((Some(false), Some(28))),
+            None,
+            Some((Some(true), Some(42))),
+        ]);
+        assert_eq!(&expected, actual.as_struct());
+
+        // Non-null indices on a null-free struct yield a null-free struct
+        let index = UInt32Array::from(vec![2, 0]);
+        let actual = take(&array, &index, None).unwrap();
+        assert_eq!(actual.null_count(), 0);
+
+        // Sliced struct whose slice contains no nulls
+        let array = create_test_struct(vec![
+            None,
+            Some((Some(true), Some(42))),
+            Some((Some(false), Some(28))),
+            None,
+        ]);
+        let sliced = array.slice(1, 2);
+        assert_eq!(sliced.null_count(), 0);
+        let index = UInt32Array::from(vec![Some(1), None, Some(0)]);
+        let actual = take(&sliced, &index, None).unwrap();
+        let expected = create_test_struct(vec![
+            Some((Some(false), Some(28))),
+            None,
+            Some((Some(true), Some(42))),
+        ]);
+        assert_eq!(&expected, actual.as_struct());
     }
 
     #[test]
