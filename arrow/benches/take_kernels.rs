@@ -28,6 +28,7 @@ use arrow::datatypes::*;
 use arrow::util::test_util::seedable_rng;
 use arrow::{array::*, util::bench_util::*};
 use std::hint;
+use std::sync::Arc;
 
 fn create_random_index(size: usize, null_density: f32) -> UInt32Array {
     let mut rng = seedable_rng();
@@ -41,6 +42,22 @@ fn create_random_index(size: usize, null_density: f32) -> UInt32Array {
         }
     }
     builder.finish()
+}
+
+fn create_struct_array(size: usize, null_density: f32) -> StructArray {
+    let mut rng = seedable_rng();
+    let int = Arc::new(create_primitive_array::<Int32Type>(size, 0.0)) as ArrayRef;
+    let float = Arc::new(create_primitive_array::<Float64Type>(size, 0.0)) as ArrayRef;
+    let fields = Fields::from(vec![
+        Field::new("i32", DataType::Int32, true),
+        Field::new("f64", DataType::Float64, true),
+    ]);
+    let nulls = (null_density > 0.0).then(|| {
+        (0..size)
+            .map(|_| rng.random::<f32>() >= null_density)
+            .collect()
+    });
+    StructArray::new(fields, vec![int, float], nulls)
 }
 
 fn bench_take(values: &dyn Array, indices: &UInt32Array) {
@@ -243,6 +260,23 @@ fn add_benchmark(c: &mut Criterion) {
     let values = create_primitive_list_view_array::<i32, Int32Type>(1024, 0.5, 0.5, 20);
     let indices = create_random_index(1024, 0.5);
     c.bench_function("take listview i32 null values null indices 1024", |b| {
+        b.iter(|| bench_take(&values, &indices))
+    });
+
+    let values = create_struct_array(100_000, 0.0);
+    let indices = create_random_index(100_000, 0.0);
+    c.bench_function("take struct 100000", |b| {
+        b.iter(|| bench_take(&values, &indices))
+    });
+
+    let indices = create_random_index(100_000, 0.5);
+    c.bench_function("take struct null indices 100000", |b| {
+        b.iter(|| bench_take(&values, &indices))
+    });
+
+    let values = create_struct_array(100_000, 0.5);
+    let indices = create_random_index(100_000, 0.0);
+    c.bench_function("take struct null values 100000", |b| {
         b.iter(|| bench_take(&values, &indices))
     });
 
