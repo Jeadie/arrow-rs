@@ -156,6 +156,10 @@ harness = false
 required-features = ["test_utils"]
 
 [[bench]]
+name = "temporal_kernels"
+harness = false
+
+[[bench]]
 name = "cast_kernels"
 harness = false
 required-features = ["test_utils"]

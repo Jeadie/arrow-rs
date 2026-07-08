@@ -171,6 +171,101 @@ where
     }
 }
 
+/// Converts days since the UNIX epoch to a `(year, month, day)` tuple in the
+/// proleptic Gregorian calendar (the calendar chrono uses).
+///
+/// This is Howard Hinnant's `civil_from_days` algorithm, see
+/// <https://howardhinnant.github.io/date_algorithms.html#civil_from_days>
+#[inline]
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097); // [0, 146096]
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m, d)
+}
+
+/// Extracts only the year component of [`civil_from_days`], skipping the
+/// month/day computations. `doy >= 306` is equivalent to `month <= 2` in the
+/// March-based year used by the algorithm.
+#[inline]
+fn year_from_days(days: i64) -> i32 {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097); // [0, 146096]
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    (yoe + era * 400 + (doy >= 306) as i64) as i32
+}
+
+/// Range of seconds since the UNIX epoch representable by chrono's
+/// [`NaiveDateTime`](chrono::NaiveDateTime). Used by the fast integer paths
+/// below so that they return `None` for exactly the same out-of-range inputs
+/// as the chrono based paths.
+fn chrono_epoch_secs_bounds() -> (i64, i64) {
+    (
+        chrono::NaiveDateTime::MIN.and_utc().timestamp(),
+        chrono::NaiveDateTime::MAX.and_utc().timestamp(),
+    )
+}
+
+/// Fast path to extract [`DatePart`]s that can be computed with plain integer
+/// arithmetic on seconds since the UNIX epoch, avoiding the cost of
+/// constructing a chrono `NaiveDateTime` per element.
+///
+/// This is only valid for UTC / timezone-naive values: `to_secs` must convert
+/// a native value to *UTC* seconds since the epoch (rounding towards negative
+/// infinity, e.g. with `div_euclid`).
+///
+/// Returns `None` if `part` is not supported by the fast path, in which case
+/// callers fall back to chrono.
+fn date_part_from_epoch_secs<T, F>(
+    array: &PrimitiveArray<T>,
+    part: DatePart,
+    to_secs: F,
+) -> Option<Int32Array>
+where
+    T: ArrowPrimitiveType,
+    F: Fn(T::Native) -> i64 + Copy,
+{
+    let (min_secs, max_secs) = chrono_epoch_secs_bounds();
+    let in_range = move |secs: i64| (min_secs..=max_secs).contains(&secs);
+    let array = match part {
+        DatePart::Year => array.unary_opt(move |v| {
+            let secs = to_secs(v);
+            in_range(secs).then(|| year_from_days(secs.div_euclid(SECONDS_IN_DAY)))
+        }),
+        DatePart::Month => array.unary_opt(move |v| {
+            let secs = to_secs(v);
+            in_range(secs).then(|| civil_from_days(secs.div_euclid(SECONDS_IN_DAY)).1 as i32)
+        }),
+        DatePart::Day => array.unary_opt(move |v| {
+            let secs = to_secs(v);
+            in_range(secs).then(|| civil_from_days(secs.div_euclid(SECONDS_IN_DAY)).2 as i32)
+        }),
+        DatePart::Hour => array.unary_opt(move |v| {
+            let secs = to_secs(v);
+            in_range(secs).then(|| secs.div_euclid(3_600).rem_euclid(24) as i32)
+        }),
+        DatePart::Minute => array.unary_opt(move |v| {
+            let secs = to_secs(v);
+            in_range(secs).then(|| secs.div_euclid(60).rem_euclid(60) as i32)
+        }),
+        DatePart::Second => array.unary_opt(move |v| {
+            let secs = to_secs(v);
+            in_range(secs).then(|| secs.rem_euclid(60) as i32)
+        }),
+        _ => return None,
+    };
+    Some(array)
+}
+
 /// Given an array, return a new array with the extracted [`DatePart`] as signed 32-bit
 /// integer values.
 ///
@@ -401,6 +496,10 @@ impl ExtractDatePartExt for PrimitiveArray<Date32Type> {
                 vec![0; self.len()].into(),
                 self.nulls().cloned(),
             ))
+        } else if let Some(array) =
+            date_part_from_epoch_secs(self, part, |d| d as i64 * SECONDS_IN_DAY)
+        {
+            Ok(array)
         } else {
             let map_func = get_date_time_part_extract_fn(part);
             Ok(self.unary_opt(|d| date32_to_datetime(d).map(map_func)))
@@ -410,6 +509,9 @@ impl ExtractDatePartExt for PrimitiveArray<Date32Type> {
 
 impl ExtractDatePartExt for PrimitiveArray<Date64Type> {
     fn date_part(&self, part: DatePart) -> Result<Int32Array, ArrowError> {
+        if let Some(array) = date_part_from_epoch_secs(self, part, |d| d.div_euclid(MILLISECONDS)) {
+            return Ok(array);
+        }
         let map_func = get_date_time_part_extract_fn(part);
         Ok(self.unary_opt(|d| date64_to_datetime(d).map(map_func)))
     }
@@ -428,6 +530,8 @@ impl ExtractDatePartExt for PrimitiveArray<TimestampSecondType> {
                         .map(|c| Utc.from_utc_datetime(&c).with_timezone(&tz))
                         .map(map_func)
                 })
+            } else if let Some(array) = date_part_from_epoch_secs(self, part, |d| d) {
+                array
             } else {
                 let map_func = get_date_time_part_extract_fn(part);
                 self.unary_opt(|d| timestamp_s_to_datetime(d).map(map_func))
@@ -445,6 +549,10 @@ impl ExtractDatePartExt for PrimitiveArray<TimestampMillisecondType> {
                     .map(|c| Utc.from_utc_datetime(&c).with_timezone(&tz))
                     .map(map_func)
             })
+        } else if let Some(array) =
+            date_part_from_epoch_secs(self, part, |d| d.div_euclid(MILLISECONDS))
+        {
+            array
         } else {
             let map_func = get_date_time_part_extract_fn(part);
             self.unary_opt(|d| timestamp_ms_to_datetime(d).map(map_func))
@@ -462,6 +570,10 @@ impl ExtractDatePartExt for PrimitiveArray<TimestampMicrosecondType> {
                     .map(|c| Utc.from_utc_datetime(&c).with_timezone(&tz))
                     .map(map_func)
             })
+        } else if let Some(array) =
+            date_part_from_epoch_secs(self, part, |d| d.div_euclid(MICROSECONDS))
+        {
+            array
         } else {
             let map_func = get_date_time_part_extract_fn(part);
             self.unary_opt(|d| timestamp_us_to_datetime(d).map(map_func))
@@ -479,6 +591,10 @@ impl ExtractDatePartExt for PrimitiveArray<TimestampNanosecondType> {
                     .map(|c| Utc.from_utc_datetime(&c).with_timezone(&tz))
                     .map(map_func)
             })
+        } else if let Some(array) =
+            date_part_from_epoch_secs(self, part, |d| d.div_euclid(NANOSECONDS))
+        {
+            array
         } else {
             let map_func = get_date_time_part_extract_fn(part);
             self.unary_opt(|d| timestamp_ns_to_datetime(d).map(map_func))
@@ -766,6 +882,87 @@ mod tests {
     ) -> Result<Int32Array, ArrowError> {
         let array = date_part(array, part)?;
         Ok(array.as_primitive::<Int32Type>().to_owned())
+    }
+
+    /// The fast integer paths in [`date_part_from_epoch_secs`] must agree
+    /// with chrono for every supported part, including pre-1970 timestamps,
+    /// sub-second remainders on negative values, and out-of-range values
+    /// (which chrono maps to `None`/null).
+    #[test]
+    fn test_date_part_fast_path_matches_chrono() {
+        const FAST_PARTS: [DatePart; 6] = [
+            DatePart::Year,
+            DatePart::Month,
+            DatePart::Day,
+            DatePart::Hour,
+            DatePart::Minute,
+            DatePart::Second,
+        ];
+        let (min_secs, max_secs) = chrono_epoch_secs_bounds();
+
+        // ~±2000 years of seconds, stepped by a prime to hit uneven
+        // day/hour/minute boundaries, plus edge cases around zero and the
+        // chrono representable range.
+        let mut secs: Vec<i64> = (-63_200_000_000i64..=63_200_000_000)
+            .step_by(7_919_333)
+            .collect();
+        secs.extend([
+            0,
+            1,
+            -1,
+            59,
+            -59,
+            86_399,
+            -86_399,
+            86_400,
+            -86_400,
+            min_secs,
+            min_secs - 1,
+            max_secs,
+            max_secs + 1,
+            i64::MIN,
+            i64::MAX,
+        ]);
+
+        let s_array = TimestampSecondArray::from(secs.clone());
+        for part in FAST_PARTS {
+            let expected: Int32Array = secs
+                .iter()
+                .map(|&s| timestamp_s_to_datetime(s).map(get_date_time_part_extract_fn(part)))
+                .collect();
+            let actual = date_part_primitive(&s_array, part).unwrap();
+            assert_eq!(actual, expected, "TimestampSecond {part}");
+        }
+
+        // Millisecond-resolution values with sub-second remainders, so that
+        // negative values exercise `div_euclid` (floor) semantics.
+        let ms: Vec<i64> = secs
+            .iter()
+            .filter_map(|&s| s.checked_mul(1_000).and_then(|ms| ms.checked_add(777)))
+            .collect();
+        let ms_array = TimestampMillisecondArray::from(ms.clone());
+        for part in FAST_PARTS {
+            let expected: Int32Array = ms
+                .iter()
+                .map(|&v| timestamp_ms_to_datetime(v).map(get_date_time_part_extract_fn(part)))
+                .collect();
+            let actual = date_part_primitive(&ms_array, part).unwrap();
+            assert_eq!(actual, expected, "TimestampMillisecond {part}");
+        }
+
+        // Date32 across ±~5000 years plus the extremes (which chrono cannot
+        // represent and must stay null).
+        let mut days: Vec<i32> = (-2_000_000..=2_000_000).step_by(7_919).collect();
+        days.extend([0, 1, -1, i32::MIN, i32::MAX]);
+        let d_array = Date32Array::from(days.clone());
+        for part in [DatePart::Year, DatePart::Month, DatePart::Day] {
+            let expected: Int32Array = days
+                .iter()
+                .map(|&d| date32_to_datetime(d).map(get_date_time_part_extract_fn(part)))
+                .collect();
+            let actual = date_part_primitive(&d_array, part).unwrap();
+            assert_eq!(actual, expected, "Date32 {part}");
+        }
     }
 
     #[test]
